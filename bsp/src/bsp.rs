@@ -1,10 +1,22 @@
 use crate::geometry::*;
+use crate::vector;
 use crate::vector::{Vec3, Vec2};
 use std::rc::Rc;
 
-type Vertex = Rc<(Vec3, Vec2)>;
-type Vertices = Vec<Vertex>;
-type Ngon = Rc<Vertices>;
+#[derive(Debug)]
+#[derive(Clone)]
+struct Vertex {
+    pos: Vec3,
+    uv: Vec2
+}
+
+type Vertices = Vec<Rc<Vertex>>;
+
+#[derive(Debug)]
+struct Ngon {
+    v: Vertices,
+    norm: Rc<Vec3>
+}
 
 #[derive(Debug)]
 pub enum Node {
@@ -19,8 +31,8 @@ pub struct SplitNode {
 
 #[derive(Debug)]
 pub struct LeafNode {
-    contents: Vec<Ngon>,
-    portals: Vec<Ngon>
+    contents: Vec<Rc<Ngon>>,
+    portals: Vec<Vec<Rc<Vertex>>>
 }
 
 #[derive(Debug)]
@@ -28,7 +40,7 @@ enum Intersection {
     OnPlane,
     InFront,
     Behind,
-    Split(Vertices, Vertices)
+    Split(Rc<Ngon>, Rc<Ngon>)
 }
 
 #[derive(PartialEq)]
@@ -38,38 +50,49 @@ enum PointInt {
     Behind
 }
 
-#[derive(PartialEq)]
-enum Side {
-    InFront,
-    Behind
-}
-
 impl Node {
     pub fn from_obj(obj: &obj::raw::object::RawObj) -> Option<Node> {
-        let vertices: Vertices = obj.points.iter()
-            .map(|&p| {
-                let vertices: [f32; 3] = Into::<[f32; 4]>::into(obj.positions[p])[0..3].try_into().unwrap();
-                let texture: [f32; 2] = Into::<[f32; 3]>::into(obj.tex_coords[p])[0..2].try_into().unwrap();
-                Rc::new((vertices, texture))
-            })
+        let vertices: Vec<Rc<Vec3>> = obj.positions.iter()
+            .map(|&p| Rc::new(Into::<[f32; 4]>::into(p)[0..3].try_into().unwrap()))
+            .collect();
+        let normals: Vec<Rc<Vec3>> = obj.normals.iter()
+            .map(|&p| Rc::new(p.try_into().unwrap()))
+            .collect();
+        let textures: Vec<Rc<Vec2>> = obj.tex_coords.iter()
+            .map(|&t| Rc::new(Into::<[f32; 3]>::into(t)[0..2].try_into().unwrap()))
             .collect();
         let faces = obj.polygons.iter()
             .map(|f| match f {
                 obj::raw::object::Polygon::PTN(p) => {
-                    p.iter()
-                        .map(|&(vi, ti, _)| Rc::clone(&vertices[vi]))
-                        .collect::<Vertices>()
+                    (p.iter()
+                        .map(|&(vi, ti, _)| (vertices[vi].clone(), textures[ti].clone()))
+                        .collect::<Vec<(Rc<Vec3>, Rc<Vec2>)>>(),
+                    normals[p[0].2].clone())
+                }
+                obj::raw::object::Polygon::PN(p) => {
+                    (p.iter()
+                        .map(|&(vi, _)| (vertices[vi].clone(), Rc::new([0.0, 0.0])))
+                        .collect::<Vec<(Rc<Vec3>, Rc<Vec2>)>>(),
+                    normals[p[0].1].clone())
                 }
                 _ => {
                     panic!();
                 }
             })
-            .map(|v| Rc::new(v))
+            .map(|(v, n)| Rc::new(Ngon {
+                v: v.iter()
+                    .map(|(p, u)| Rc::new(Vertex {
+                        pos: *p.clone(),
+                        uv: *u.clone()
+                    }))
+                    .collect(),
+                norm: n
+            }))
             .collect();
         let root_node = Self::create_node(&faces);
         root_node
     }
-    fn create_node(polygons: &Vec<Ngon>) -> Option<Node> {
+    fn create_node(polygons: &Vec<Rc<Ngon>>) -> Option<Node> {
         if polygons.len() == 0 {
             return None
         }
@@ -77,15 +100,14 @@ impl Node {
         let mut behind = vec![];
         let mut on_plane = vec![Rc::clone(&polygons[0])];
         let mut portal_vertices = vec![];
-        let tri_points = polygons[0][0..3].iter()
-            .map(|v| v.0)
+        let tri_points = polygons[0].v[0..3].iter()
+            .map(|v| v.pos)
             .collect::<Vec<Vec3>>()
             .try_into().unwrap();
         let plane = Plane::from_tri(&tri_points);
-        println!("{:?}", plane);
         for polygon in polygons[1..].iter() {
             let (intersection, curr_portal_vertices) = Self::intersect(polygon, &plane);
-            portal_vertices.push(Rc::new(curr_portal_vertices));
+            portal_vertices.push(curr_portal_vertices);
             match intersection {
                 Intersection::OnPlane => {
                     on_plane.push(Rc::clone(polygon));
@@ -97,8 +119,8 @@ impl Node {
                     behind.push(Rc::clone(polygon));
                 }
                 Intersection::Split(a, b) => {
-                    in_front.push(Rc::new(b));
-                    behind.push(Rc::new(a));
+                    in_front.push(b);
+                    behind.push(a);
                 }
             }
         };
@@ -133,8 +155,8 @@ impl Node {
         ]
     }
     fn intersect(polygon: &Ngon, plane: &Plane) -> (Intersection, Vertices) {
-        let dists: Vec<f32> = polygon.iter()
-            .map(|v| plane.point_dist(&v.0))
+        let dists: Vec<f32> = polygon.v.iter()
+            .map(|v| plane.point_dist(&v.pos))
             .collect();
         let point_sides: Vec<PointInt> = dists.iter()
             .map(|&d| {
@@ -147,34 +169,37 @@ impl Node {
                 }
             }).collect();
         if point_sides.iter().all(|s| *s == PointInt::OnPlane) {
-            return (Intersection::OnPlane, (*polygon).to_vec())
+            return (Intersection::OnPlane, (*polygon.v).to_vec())
         }
         let mut intersecting_vertices = vec![];
         let mut in_front: Vertices = vec![];
         let mut behind: Vertices = vec![];
-        let mut prev_i = polygon.len() - 1;
+        let mut prev_i = polygon.v.len() - 1;
         let mut state = point_sides.iter().rev().find(|&s| *s != PointInt::OnPlane).unwrap();
-        for i in 0..polygon.len() {
+        for i in 0..polygon.v.len() {
             if point_sides[i] != PointInt::OnPlane {
                 let new_state = &point_sides[i];
                 if new_state != state {
                     // Side changed, the triangle intersects the plane
-                    let side_line = Line::from_points(&polygon[prev_i].0, &polygon[i].0);
+                    let side_line = Line::from_points(&polygon.v[prev_i].pos, &polygon.v[i].pos);
                     let (amt, intersection_point) = plane.intersect_line(&side_line).unwrap();
-                    let texture_point = Self::interpolate_texture(amt, &polygon[prev_i].1, &polygon[i].1);
-                    let intersection_v = Rc::new((intersection_point, texture_point));
+                    let texture_point = Self::interpolate_texture(amt, &polygon.v[prev_i].uv, &polygon.v[i].uv);
+                    let intersection_v = Rc::new(Vertex {
+                        pos: intersection_point,
+                        uv: texture_point
+                    });
                     behind.push(intersection_v.clone());
                     in_front.push(intersection_v.clone());
                     intersecting_vertices.push(intersection_v.clone());
                     state = new_state;
                 }
             } else {
-                intersecting_vertices.push(polygon[i].clone())
+                intersecting_vertices.push(polygon.v[i].clone())
             }
             if *state == PointInt::Behind {
-                behind.push(polygon[i].clone());
+                behind.push(polygon.v[i].clone());
             } else {
-                in_front.push(polygon[i].clone());
+                in_front.push(polygon.v[i].clone());
             }
             prev_i = i;
         }
@@ -184,30 +209,88 @@ impl Node {
         if behind.len() == 0 {
             return (Intersection::InFront, intersecting_vertices)
         }
-        (Intersection::Split(in_front, behind), intersecting_vertices)
+        (Intersection::Split(Rc::new(Ngon {
+            v: in_front,
+            norm: polygon.norm.clone()
+        }), Rc::new(Ngon {
+            v: behind,
+            norm: polygon.norm.clone()
+        })), intersecting_vertices)
     }
-    fn triangulate_polygon (polygon: &Ngon) -> Vec<Ngon> {
-        // Split the polygon into chains
-        let half_length = polygon.len() / 2;
-        let c1 = &polygon[0..half_length];
-        let c2: Vertices = polygon[half_length..].iter()
-            .map(|v| Rc::clone(&v))
-            .rev().collect();
-        let mut tris: Vec<Ngon> = vec![];
-        let mut p1 = &c1[0];
-        let mut p2 = &c2[0];
-        for i in 1..half_length {
-            let new_p1 = &c1[i];
-            tris.push(Rc::new(vec![p1.clone(), p2.clone(), new_p1.clone()]));
-            p1 = new_p1;
-            let new_p2 = &c2[i];
-            tris.push(Rc::new(vec![p1.clone(), p2.clone(), new_p2.clone()]));
-            p2 = new_p2;
+    fn check_ear(tri: &[Rc<Vertex>; 3], normal: &Vec3, points: &Vec<Rc<Vertex>>) -> bool {
+        let (axis, sign) = if normal[0].abs() > normal[1].abs() {
+            if normal[0].abs() > normal[2].abs() {
+                ((1, 2), 0)
+            } else {
+                ((0, 1), 2)
+            }
+        } else {
+            if normal[2].abs() > normal[1].abs() {
+                ((0, 1), 2)
+            } else {
+                ((2, 0), 1)
+            }
+        };
+        let sign = normal[sign] > 0.0;
+        let tri: [Vec2; 3] = tri.clone().map(|p| [p.pos[axis.0], p.pos[axis.1]]);
+        let points: Vec<Vec2> = points.iter().map(|p| [p.pos[axis.0], p.pos[axis.1]]).collect();
+        let ab = vector::subtract(&tri[1], &tri[0]);
+        let bc = vector::subtract(&tri[2], &tri[1]);
+        let ab_x_bc_sign = vector::cross_product2(&ab, &bc) > 0.0;
+        if ab_x_bc_sign != sign {
+            return false
         }
-        if 2 * half_length < polygon.len() {
-            tris.push(Rc::new(vec![p1.clone(), p2.clone(), c2[half_length].clone()]));
+        let ca = vector::subtract(&tri[0], &tri[2]);
+        for p in points.iter() {
+            let ap = vector::subtract(p, &tri[0]);
+            let bp = vector::subtract(p, &tri[1]);
+            let cp = vector::subtract(p, &tri[2]);
+            let ab_x_ap_sign = vector::cross_product2(&ab, &ap) > 0.0;
+            let bc_x_bp_sign = vector::cross_product2(&bc, &bp) > 0.0;
+            let ca_x_cp_sign = vector::cross_product2(&ca, &cp) > 0.0;
+            if ab_x_ap_sign == bc_x_bp_sign && bc_x_bp_sign == ca_x_cp_sign {
+                return false
+            }
         }
-        tris
+        return true
+    }
+    fn triangulate_polygon(polygon: &Ngon) -> Vec<Ngon> {
+        // Ear clipping triangulation
+        assert_eq!(polygon.v.len() >= 3, true);
+        let mut vertices: Vertices = polygon.v.to_vec();
+        let mut result: Vec<Vertices> = vec![];
+        'remove_ears: while vertices.len() > 3 {
+            'find_ear: for i in 0..vertices.len() {
+                let potential_ear_indices = [i, i+1, i+2]
+                    .map(|n| n % vertices.len())
+                    .to_owned();
+                let potential_ear: [Rc<Vertex>; 3] = potential_ear_indices
+                    .map(|n| vertices[n].clone());
+                let others_indices: Vec<usize> = (0..vertices.len())
+                    .filter(|n| !potential_ear_indices.iter().find(|&x| x == n).is_some())
+                    .collect();
+                let others: Vec<Rc<Vertex>> = others_indices.iter()
+                    .map(|&n| vertices[n].clone())
+                    .collect();
+                if !Self::check_ear(&potential_ear, &*polygon.norm, &others) {
+                    // println!("Ear not found: {}; {}; {}; {:?}; {:?}; {:?}; {:?}", result.len(), i, vertices.len(), potential_ear_indices, others_indices, potential_ear.map(|p| p.pos), others.iter().map(|p| &p.pos).collect::<Vec<_>>());
+                    continue 'find_ear
+                }
+                result.push(potential_ear.to_vec());
+                vertices.remove((i+1)%vertices.len());
+                continue 'remove_ears
+            }
+            // No ears found
+            break
+        }
+        // assert_eq!(polygon.len() == 3, true);
+        result.push(vertices[..3].to_vec());
+        result.iter()
+            .map(|vertices| Ngon {
+                norm: polygon.norm.clone(),
+                v: vertices.to_vec()
+            })
+            .collect()
     }
     fn flatten(node: &Option<Node>) -> Vec<stl_io::Triangle> {
         match node {
@@ -222,9 +305,9 @@ impl Node {
                     .map(|v| Node::triangulate_polygon(v))
                     .flatten()
                     .map(|t| stl_io::Triangle {
-                        normal: stl_io::Normal::new([0.0, 0.0, 0.0]),
-                        vertices: t.iter()
-                            .map(|v| stl_io::Vertex::new(v.0))
+                        normal: stl_io::Normal::new(*t.norm),
+                        vertices: t.v.iter()
+                            .map(|v| stl_io::Vertex::new(v.pos))
                             .collect::<Vec<stl_io::Vertex>>()[..3]
                             .try_into().unwrap()
                     })

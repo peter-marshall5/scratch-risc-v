@@ -15,12 +15,11 @@ pub struct Line {
 }
 
 impl Line {
+    // pub fn normal(p1: &Vec3, p2: &Vec3) -> Vec3 {
+    //     vector::normalize(&vector::subtract(p2, p1))
+    // }
     pub fn from_points(p1: &Vec3, p2: &Vec3) -> Line {
-        let direction = [
-            p2[0] - p1[0],
-            p2[1] - p1[1],
-            p2[2] - p1[2],
-        ];
+        let direction = vector::subtract(p2, p1);
         let length = vector::magnitude(&direction);
         let normal = vector::normalize(&direction);
         Line {
@@ -42,7 +41,7 @@ impl Plane {
     pub fn new(normal: &Vec3, point: &Vec3) -> Plane {
         Plane {
             normal: *normal,
-            dist: -(normal[0] * point[0]) - (normal[1] * point[1]) - (normal[2] * point[2])
+            dist: -(vector::dot_product(normal, point))
         }
     }
     pub fn from_tri(tri: &[Vec3; 3]) -> Plane {
@@ -53,7 +52,7 @@ impl Plane {
         Plane::new(&normal, &tri[0])
     }
     pub fn point_dist(&self, point: &Vec3) -> f32 {
-        self.normal[0] * point[0] + self.normal[1] * point[1] + self.normal[2] * point[2] + self.dist
+        vector::dot_product(&self.normal, point) + self.dist
     }
     fn intersection_step(&self, dist: &f32, divergence: &f32) -> f32 {
         // Compute where the line step function intersects with the plane
